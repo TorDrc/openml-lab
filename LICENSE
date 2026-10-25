@@ -1,0 +1,12 @@
+# Security Policy
+
+## Reporting
+
+Please report vulnerabilities by opening a GitHub Security Advisory or contacting the maintainer privately. Avoid posting security details in public issues.
+
+## Safe handling
+
+- Do not commit access tokens, API keys, or secrets.
+- Treat uploaded CSV files as untrusted input.
+- Validate file content before training or previewing.
+- Browser-side processing is limited by client security and browser vulnerabilities.

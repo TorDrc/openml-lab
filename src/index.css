@@ -1,0 +1,606 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  createClassificationModel,
+  predictClassification,
+  trainClassificationModel,
+  trainRegressionModel,
+  predictRegression,
+  type ClassificationPrediction,
+  type RegressionPrediction
+} from './ml/tfModels';
+import { parseCsvText, prepareCsvTable, validateCsvRows, type CsvTable } from './utils/csv';
+import { CLASSIFICATION_EXAMPLE, REGRESSION_EXAMPLE, teachingCards } from './data/sampleDatasets';
+
+const EMPTY_TABLE: CsvTable = { headers: [], rows: [], rowCount: 0, columnCount: 0 };
+
+type NavPage = 'home' | 'dashboard' | 'dataset' | 'training' | 'docs' | 'about';
+
+function App() {
+  const [theme, setTheme] = useState<'light' | 'dark'>('dark');
+  const [page, setPage] = useState<NavPage>('home');
+  const [classificationInput, setClassificationInput] = useState<number[]>(CLASSIFICATION_EXAMPLE.inputs);
+  const [regressionInput, setRegressionInput] = useState<number[]>(REGRESSION_EXAMPLE.inputs);
+  const [classificationResult, setClassificationResult] = useState<ClassificationPrediction | null>(null);
+  const [regressionResult, setRegressionResult] = useState<RegressionPrediction | null>(null);
+  const [classLoading, setClassLoading] = useState(false);
+  const [regressionLoading, setRegressionLoading] = useState(false);
+  const [datasetInfo, setDatasetInfo] = useState<CsvTable>(EMPTY_TABLE);
+  const [datasetError, setDatasetError] = useState('');
+  const [featureColumns, setFeatureColumns] = useState<string[]>([]);
+  const [targetColumn, setTargetColumn] = useState('');
+  const [uploadSource, setUploadSource] = useState('');
+  const [playgroundAlgorithm, setPlaygroundAlgorithm] = useState<'dense' | 'linear'>('dense');
+  const [playgroundEpochs, setPlaygroundEpochs] = useState(18);
+  const [playgroundLearningRate, setPlaygroundLearningRate] = useState(0.05);
+  const [playgroundStatus, setPlaygroundStatus] = useState('Ready to train');
+  const [playgroundProgress, setPlaygroundProgress] = useState(0);
+  const [playgroundIsTraining, setPlaygroundIsTraining] = useState(false);
+  const [playgroundMetrics, setPlaygroundMetrics] = useState<{ loss: number; valLoss: number; accuracy: number } | null>(null);
+  const [playgroundHistory, setPlaygroundHistory] = useState<number[]>([]);
+  const [playgroundValidation, setPlaygroundValidation] = useState<number[]>([]);
+  const trainingAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+  }, [theme]);
+
+  useEffect(() => {
+    void initializeDemoModels();
+  }, []);
+
+  const summaryStats = useMemo(
+    () => [
+      { label: 'Classification', value: classificationResult ? `${(classificationResult.confidence * 100).toFixed(0)}%` : '—' },
+      { label: 'Regression', value: regressionResult ? `${regressionResult.prediction.toFixed(2)}` : '—' },
+      { label: 'Training steps', value: `${playgroundProgress}%` },
+      { label: 'Uploaded rows', value: `${datasetInfo.rowCount}` }
+    ],
+    [classificationResult, regressionResult, playgroundProgress, datasetInfo.rowCount]
+  );
+
+  const previewRows = useMemo(() => datasetInfo.rows.slice(0, 6), [datasetInfo.rows]);
+
+  async function initializeDemoModels() {
+    const model = createClassificationModel(CLASSIFICATION_EXAMPLE.features[0].length, CLASSIFICATION_EXAMPLE.classes.length);
+    const trained = await trainClassificationModel(CLASSIFICATION_EXAMPLE.features, CLASSIFICATION_EXAMPLE.labels, {
+      epochs: 10,
+      learningRate: 0.04,
+      validationSplit: 0.2
+    });
+    const prediction = predictClassification(trained.model, classificationInput, CLASSIFICATION_EXAMPLE.classes);
+    setClassificationResult(prediction);
+    model.dispose();
+  }
+
+  async function handleTrainClassification() {
+    setClassLoading(true);
+    try {
+      const trained = await trainClassificationModel(CLASSIFICATION_EXAMPLE.features, CLASSIFICATION_EXAMPLE.labels, {
+        epochs: 16,
+        learningRate: 0.04,
+        validationSplit: 0.2
+      });
+      const prediction = predictClassification(trained.model, classificationInput, CLASSIFICATION_EXAMPLE.classes);
+      setClassificationResult(prediction);
+    } catch {
+      setClassificationResult({
+        classIndex: 0,
+        label: 'Model error',
+        confidence: 0,
+        probabilities: [0, 0, 0],
+        predictionText: 'Training error. Please retry.'
+      });
+    } finally {
+      setClassLoading(false);
+    }
+  }
+
+  async function handleTrainRegression() {
+    setRegressionLoading(true);
+    try {
+      const trained = await trainRegressionModel(REGRESSION_EXAMPLE.features, REGRESSION_EXAMPLE.targets, {
+        epochs: 20,
+        learningRate: 0.03,
+        validationSplit: 0.2
+      });
+      const prediction = predictRegression(trained.model, regressionInput);
+      setRegressionResult(prediction);
+    } catch {
+      setRegressionResult({
+        prediction: 0,
+        featureValues: regressionInput,
+        metrics: { mae: 0, rmse: 0, r2: 0 }
+      });
+    } finally {
+      setRegressionLoading(false);
+    }
+  }
+
+  function updateClassificationInput(index: number, value: string) {
+    setClassificationInput((current) => {
+      const next = [...current];
+      next[index] = Number.parseFloat(value) || 0;
+      return next;
+    });
+  }
+
+  function updateRegressionInput(index: number, value: string) {
+    setRegressionInput((current) => {
+      const next = [...current];
+      next[index] = Number.parseFloat(value) || 0;
+      return next;
+    });
+  }
+
+  function loadUploadDataset(text: string) {
+    try {
+      const rows = parseCsvText(text);
+      const validation = validateCsvRows(rows);
+      if (!validation.valid) {
+        throw new Error(validation.errors[0]);
+      }
+
+      const table = prepareCsvTable(rows);
+      setDatasetInfo(table);
+      setFeatureColumns(table.headers.slice(0, Math.max(table.headers.length - 1, 0)));
+      setTargetColumn(table.headers[table.headers.length - 1] ?? '');
+      setDatasetError('');
+      setUploadSource('CSV uploaded locally');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to parse CSV file.';
+      setDatasetError(message);
+      setDatasetInfo(EMPTY_TABLE);
+      setUploadSource('');
+    }
+  }
+
+  function onUploadFile(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    void file.text()
+      .then((text) => loadUploadDataset(text))
+      .catch(() => setDatasetError('The uploaded file could not be read. Please try a different CSV.'));
+  }
+
+  async function handlePlaygroundTrain() {
+    if (playgroundIsTraining) {
+      trainingAbortRef.current?.abort();
+      setPlaygroundIsTraining(false);
+      setPlaygroundStatus('Training stopped');
+      return;
+    }
+
+    setPlaygroundIsTraining(true);
+    setPlaygroundStatus('Training in progress');
+    setPlaygroundProgress(0);
+    trainingAbortRef.current = new AbortController();
+
+    try {
+      const model = playgroundAlgorithm === 'linear' ? createClassificationModel(CLASSIFICATION_EXAMPLE.features[0].length, CLASSIFICATION_EXAMPLE.classes.length) : createClassificationModel(CLASSIFICATION_EXAMPLE.features[0].length, CLASSIFICATION_EXAMPLE.classes.length);
+      const result = await trainClassificationModel(CLASSIFICATION_EXAMPLE.features, CLASSIFICATION_EXAMPLE.labels, {
+        epochs: playgroundEpochs,
+        learningRate: playgroundLearningRate,
+        signal: trainingAbortRef.current.signal,
+        validationSplit: 0.2,
+        onEpochEnd: (epoch, stats) => {
+          const progress = Math.round((epoch / playgroundEpochs) * 100);
+          setPlaygroundProgress(progress);
+          setPlaygroundMetrics({
+            loss: stats.loss ?? 0,
+            valLoss: stats.valLoss ?? 0,
+            accuracy: stats.accuracy ?? 0
+          });
+        }
+      });
+
+      const preview = predictClassification(result.model, CLASSIFICATION_EXAMPLE.inputs, CLASSIFICATION_EXAMPLE.classes);
+      setClassificationResult(preview);
+      setPlaygroundStatus('Training complete');
+      setPlaygroundHistory(result.history.loss);
+      setPlaygroundValidation(result.history.valLoss);
+      setPlaygroundMetrics({
+        loss: result.history.loss[result.history.loss.length - 1] ?? 0,
+        valLoss: result.history.valLoss[result.history.valLoss.length - 1] ?? 0,
+        accuracy: result.history.accuracy[result.history.accuracy.length - 1] ?? 0
+      });
+      model.dispose();
+    } catch (error) {
+      const message = error instanceof DOMException && error.name === 'AbortError' ? 'Training stopped by user' : 'Training failed. Please check the dataset.';
+      setPlaygroundStatus(message);
+    } finally {
+      setPlaygroundIsTraining(false);
+      setPlaygroundProgress(100);
+    }
+  }
+
+  const lossChartData = playgroundHistory.length ? playgroundHistory : [0.9, 0.8, 0.7, 0.58, 0.46, 0.39];
+  const validationChartData = playgroundValidation.length ? playgroundValidation : [0.95, 0.82, 0.72, 0.61, 0.56, 0.51];
+
+  return (
+    <div className="app-shell">
+      <header className="topbar">
+        <div className="brand-wrap">
+          <div className="brand-mark">O</div>
+          <div>
+            <div className="brand-name">OpenML Lab</div>
+            <div className="brand-tag">Learn. Train. Predict. Share.</div>
+          </div>
+        </div>
+        <nav className="nav" aria-label="Main navigation">
+          {(['home', 'dashboard', 'dataset', 'training', 'docs', 'about'] as NavPage[]).map((entry) => (
+            <button key={entry} className={`nav-btn ${page === entry ? 'active' : ''}`} onClick={() => setPage(entry)}>
+              {entry}
+            </button>
+          ))}
+        </nav>
+        <button className="theme-toggle" onClick={() => setTheme((current) => (current === 'dark' ? 'light' : 'dark'))}>
+          {theme === 'dark' ? 'Light mode' : 'Dark mode'}
+        </button>
+      </header>
+
+      <main className="page-shell">
+        {page === 'home' && (
+          <>
+            <section className="hero panel">
+              <div>
+                <p className="eyebrow">Browser-first ML laboratory</p>
+                <h1>Train, predict, and learn machine learning in your browser.</h1>
+                <p className="lead">
+                  OpenML Lab makes it easy to train lightweight models locally, inspect datasets, and understand the basics of classification, regression, and evaluation without paid APIs.
+                </p>
+                <div className="cta-row">
+                  <button className="primary" onClick={() => setPage('dashboard')}>Launch dashboard</button>
+                  <button className="secondary" onClick={() => setPage('dataset')}>Upload dataset</button>
+                </div>
+                <ul className="feature-list">
+                  <li>No account required</li>
+                  <li>TensorFlow.js running locally</li>
+                  <li>Public GitHub Pages hosting</li>
+                </ul>
+              </div>
+
+              <div className="panel subtle">
+                <div className="visual-stage">
+                  <div className="hud-title">Model health</div>
+                  <div className="metric-grid">
+                    {summaryStats.map((stat) => (
+                      <div key={stat.label} className="stat-card">
+                        <span>{stat.label}</span>
+                        <strong>{stat.value}</strong>
+                      </div>
+                    ))}
+                  </div>
+                  <svg viewBox="0 0 320 170" className="line-chart" role="img" aria-label="Training overview chart">
+                    <polyline points="0,120 35,110 70,90 105,85 140,70 175,63 210,52 245,38 280,24 320,10" />
+                  </svg>
+                </div>
+              </div>
+            </section>
+
+            <section className="feature-grid">
+              {teachingCards.map((card) => (
+                <article key={card.title} className="panel feature-card">
+                  <div className="feature-icon">{card.emoji}</div>
+                  <h3>{card.title}</h3>
+                  <p>{card.description}</p>
+                </article>
+              ))}
+            </section>
+          </>
+        )}
+
+        {page === 'dashboard' && (
+          <section className="dashboard-grid">
+            <div className="panel demo-panel">
+              <div className="panel-header">
+                <h2>Classification demo</h2>
+                <button className="small-primary" onClick={handleTrainClassification} disabled={classLoading}>
+                  {classLoading ? 'Training...' : 'Train model'}
+                </button>
+              </div>
+
+              <div className="field-grid">
+                {CLASSIFICATION_EXAMPLE.featureNames.map((label, index) => (
+                  <label key={label}>
+                    <span>{label}</span>
+                    <input
+                      type="number"
+                      step="0.1"
+                      value={classificationInput[index]}
+                      onChange={(event) => updateClassificationInput(index, event.target.value)}
+                    />
+                  </label>
+                ))}
+              </div>
+
+              <div className="result-box">
+                <h3>Prediction</h3>
+                <p className="prediction-text">{classificationResult?.predictionText ?? 'Waiting for model output'}</p>
+                <div className="metric-row">
+                  <span>Confidence</span>
+                  <strong>{classificationResult ? `${(classificationResult.confidence * 100).toFixed(1)}%` : '—'}</strong>
+                </div>
+                <div className="metric-row">
+                  <span>Class</span>
+                  <strong>{classificationResult?.label ?? '—'}</strong>
+                </div>
+              </div>
+            </div>
+
+            <div className="panel demo-panel">
+              <div className="panel-header">
+                <h2>Regression demo</h2>
+                <button className="small-primary" onClick={handleTrainRegression} disabled={regressionLoading}>
+                  {regressionLoading ? 'Training...' : 'Train model'}
+                </button>
+              </div>
+
+              <div className="field-grid single">
+                {REGRESSION_EXAMPLE.featureNames.map((label, index) => (
+                  <label key={label}>
+                    <span>{label}</span>
+                    <input
+                      type="number"
+                      step="0.1"
+                      value={regressionInput[index]}
+                      onChange={(event) => updateRegressionInput(index, event.target.value)}
+                    />
+                  </label>
+                ))}
+              </div>
+
+              <div className="result-box">
+                <h3>Prediction</h3>
+                <p className="prediction-text">{regressionResult ? `Estimated value: ${regressionResult.prediction.toFixed(2)}` : 'Waiting for model output'}</p>
+                <div className="metric-row">
+                  <span>MAE</span>
+                  <strong>{regressionResult ? regressionResult.metrics.mae.toFixed(3) : '—'}</strong>
+                </div>
+                <div className="metric-row">
+                  <span>RMSE</span>
+                  <strong>{regressionResult ? regressionResult.metrics.rmse.toFixed(3) : '—'}</strong>
+                </div>
+                <div className="metric-row">
+                  <span>R²</span>
+                  <strong>{regressionResult ? regressionResult.metrics.r2.toFixed(3) : '—'}</strong>
+                </div>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {page === 'dataset' && (
+          <section className="dataset-layout">
+            <div className="panel dataset-panel">
+              <div className="panel-header">
+                <h2>Dataset laboratory</h2>
+                <a className="download-link" href={`${import.meta.env.BASE_URL}datasets/iris-sample.csv`} download>
+                  Download Iris sample
+                </a>
+              </div>
+
+              <div className="upload-actions">
+                <label className="file-picker">
+                  <input type="file" accept=".csv,text/csv" onChange={onUploadFile} />
+                  <span>Upload CSV</span>
+                </label>
+                <button
+                  className="secondary"
+                  onClick={() =>
+                    loadUploadDataset(
+                      'sepal_length,sepal_width,petal_length,petal_width,species\n5.1,3.5,1.4,0.2,setosa\n6.9,3.1,4.9,1.5,virginica\n4.8,3.4,1.9,0.2,setosa'
+                    )
+                  }
+                >
+                  Load demo data
+                </button>
+              </div>
+
+              {datasetError ? <div className="error-box">{datasetError}</div> : null}
+
+              {datasetInfo.headers.length > 0 && (
+                <>
+                  <div className="column-selectors">
+                    <label>
+                      <span>Feature columns</span>
+                      <select
+                        multiple
+                        value={featureColumns}
+                        onChange={(event) =>
+                          setFeatureColumns(Array.from(event.target.selectedOptions, (option) => option.value))
+                        }
+                      >
+                        {datasetInfo.headers.map((header) => (
+                          <option key={header} value={header}>
+                            {header}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+
+                    <label>
+                      <span>Target column</span>
+                      <select value={targetColumn} onChange={(event) => setTargetColumn(event.target.value)}>
+                        {datasetInfo.headers.map((header) => (
+                          <option key={header} value={header}>
+                            {header}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+
+                  <div className="table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          {datasetInfo.headers.map((header) => (
+                            <th key={header}>{header}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {previewRows.map((row, rowIndex) => (
+                          <tr key={`${rowIndex}-${row.join('-')}`}>
+                            {row.map((cell, cellIndex) => (
+                              <td key={`${rowIndex}-${cellIndex}`}>{cell}</td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="panel dataset-side">
+              <h3>Dataset safety checklist</h3>
+              <ul className="checklist">
+                <li>Files are processed on the client device.</li>
+                <li>Missing values are flagged before training.</li>
+                <li>Feature and target columns are selected explicitly.</li>
+                <li>Numeric columns are validated before modeling.</li>
+                <li>Browser-side processing is not a guarantee against malicious files.</li>
+              </ul>
+
+              <div className="small-card">
+                <div className="pill">Source</div>
+                <p>{uploadSource || 'No local CSV uploaded yet.'}</p>
+                <div className="pill">Rows</div>
+                <p>{datasetInfo.rowCount || 0}</p>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {page === 'training' && (
+          <section className="training-layout">
+            <div className="panel">
+              <div className="panel-header">
+                <h2>Training workspace</h2>
+                <button className="primary" onClick={handlePlaygroundTrain}>
+                  {playgroundIsTraining ? 'Stop training' : 'Start training'}
+                </button>
+              </div>
+
+              <div className="training-controls">
+                <label>
+                  <span>Algorithm</span>
+                  <select value={playgroundAlgorithm} onChange={(event) => setPlaygroundAlgorithm(event.target.value as 'dense' | 'linear')}>
+                    <option value="dense">Dense network</option>
+                    <option value="linear">Linear model</option>
+                  </select>
+                </label>
+
+                <label>
+                  <span>Epochs</span>
+                  <input type="number" min="5" max="40" value={playgroundEpochs} onChange={(event) => setPlaygroundEpochs(Number(event.target.value) || 10)} />
+                </label>
+
+                <label>
+                  <span>Learning rate</span>
+                  <input type="number" min="0.001" max="0.2" step="0.001" value={playgroundLearningRate} onChange={(event) => setPlaygroundLearningRate(Number(event.target.value) || 0.05)} />
+                </label>
+              </div>
+
+              <div className="progress-wrap">
+                <div className="progress-bar">
+                  <span style={{ width: `${playgroundProgress}%` }} />
+                </div>
+                <p>{playgroundStatus}</p>
+              </div>
+            </div>
+
+            <div className="panel chart-panel">
+              <h3>Loss</h3>
+              <ChartPanel values={lossChartData} color="var(--accent)" />
+              <h3>Validation loss</h3>
+              <ChartPanel values={validationChartData} color="var(--accent-soft)" />
+            </div>
+
+            <div className="panel metrics-panel">
+              <h3>Training metrics</h3>
+              {playgroundMetrics ? (
+                <div className="metric-list">
+                  <div className="metric-row"><span>Loss</span><strong>{playgroundMetrics.loss.toFixed(3)}</strong></div>
+                  <div className="metric-row"><span>Validation loss</span><strong>{playgroundMetrics.valLoss.toFixed(3)}</strong></div>
+                  <div className="metric-row"><span>Accuracy</span><strong>{playgroundMetrics.accuracy.toFixed(3)}</strong></div>
+                </div>
+              ) : (
+                <p>Run a training session to view metrics.</p>
+              )}
+            </div>
+          </section>
+        )}
+
+        {page === 'docs' && (
+          <section className="docs-grid">
+            <div className="panel docs-panel">
+              <h2>Machine learning basics</h2>
+              <div className="doc-list">
+                <article>
+                  <h3>Classification</h3>
+                  <p>Classification assigns examples to labels such as setosa, versicolor, or virginica. The model learns patterns from known examples and predicts the label for new inputs.</p>
+                </article>
+                <article>
+                  <h3>Regression</h3>
+                  <p>Regression predicts a numeric output such as price, temperature, or score. It estimates a continuous relationship between input features and target values.</p>
+                </article>
+                <article>
+                  <h3>Overfitting</h3>
+                  <p>When a model memorizes training data too closely, it often performs poorly on unseen data. Validation metrics help detect this issue.</p>
+                </article>
+                <article>
+                  <h3>Training and validation</h3>
+                  <p>We split data into training and validation subsets to better estimate how well a model generalizes to new examples.</p>
+                </article>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {page === 'about' && (
+          <section className="about-layout">
+            <div className="panel about-panel">
+              <h2>About OpenML Lab</h2>
+              <p>OpenML Lab is an open-source browser playground for learning ML. It runs locally on the device and keeps data private by default.</p>
+              <ul className="checklist">
+                <li>Public source code on GitHub.</li>
+                <li>Zero mandatory account or API key.</li>
+                <li>TensorFlow.js data processing and model training in browser.</li>
+                <li>Responsive interface for mobile and desktop.</li>
+                <li>Static hosting on GitHub Pages with no paid backend.</li>
+              </ul>
+            </div>
+          </section>
+        )}
+      </main>
+    </div>
+  );
+}
+
+function ChartPanel({ values, color }: { values: number[]; color: string }) {
+  if (!values.length) {
+    return <div className="chart-empty">No chart data yet.</div>;
+  }
+
+  const max = Math.max(...values, 1);
+  const min = Math.min(...values, 0);
+  const points = values
+    .map((value, index) => {
+      const x = (index / Math.max(values.length - 1, 1)) * 100;
+      const y = 100 - ((value - min) / Math.max(max - min, 0.01)) * 100;
+      return `${x},${y}`;
+    })
+    .join(' ');
+
+  return (
+    <svg viewBox="0 0 100 100" className="mini-chart" role="img" aria-label="Model training chart">
+      <polyline points={points} fill="none" stroke={color} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+export default App;
