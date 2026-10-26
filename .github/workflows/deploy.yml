@@ -1,0 +1,89 @@
+name: CI and deploy to GitHub Pages
+
+# Pull requests: lint, test, build and verify (no deployment).
+# Pushes to main (and manual runs on main): the same checks, then deploy to GitHub Pages.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege by default. Only the deploy job gets the extra Pages permissions.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Lint, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Require a lockfile
+        run: |
+          if [ ! -f package-lock.json ]; then
+            echo "::error title=package-lock.json is missing::Run 'npm install' locally once and commit package-lock.json. CI installs with 'npm ci' for reproducible builds."
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies (from lockfile)
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Work out the Pages base path
+        id: base
+        run: |
+          REPO="${GITHUB_REPOSITORY#*/}"
+          # A repository named <owner>.github.io is a root site; every other repository is a project site served from /<repo>/.
+          if [[ "$REPO" == *.github.io ]]; then
+            echo "path=/" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=/${REPO}/" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        env:
+          VITE_BASE: ${{ steps.base.outputs.path }}
+          VITE_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: npm run build
+
+      - name: Verify production asset paths
+        run: node scripts/verify-dist.mjs dist "${{ steps.base.outputs.path }}"
+
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write # publish to GitHub Pages
+      id-token: write # let deploy-pages verify the artifact's origin
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,245 +1,261 @@
-import * as tf from '@tensorflow/tfjs';
+import { sanitizeColumnName, sanitizeText, toCsvField } from './sanitize';
 
-export type ClassificationPrediction = {
-  classIndex: number;
-  label: string;
-  confidence: number;
-  probabilities: number[];
-  predictionText: string;
-};
+/** Hard limits applied to every uploaded file. Everything runs in the browser. */
+export const CSV_LIMITS = {
+  maxBytes: 5 * 1024 * 1024,
+  maxRows: 20000,
+  maxColumns: 100,
+} as const;
 
-export type RegressionPrediction = {
-  prediction: number;
-  featureValues: number[];
-  metrics: { mae: number; rmse: number; r2: number };
-};
+export type CsvErrorCode =
+  | 'EMPTY'
+  | 'BAD_EXTENSION'
+  | 'TOO_LARGE'
+  | 'NOT_TEXT'
+  | 'TOO_MANY_ROWS'
+  | 'TOO_MANY_COLUMNS'
+  | 'UNTERMINATED_QUOTE'
+  | 'NO_DATA_ROWS';
 
-export type TrainingOptions = {
-  epochs?: number;
-  learningRate?: number;
-  validationSplit?: number;
-  signal?: AbortSignal;
-  onEpochEnd?: (epoch: number, stats: { loss: number; accuracy?: number; valLoss?: number; valAccuracy?: number }) => void;
-};
-
-export function createClassificationModel(inputSize: number, numClasses: number) {
-  const model = tf.sequential({
-    layers: [
-      tf.layers.dense({ inputShape: [inputSize], units: 16, activation: 'relu' }),
-      tf.layers.dense({ units: numClasses, activation: 'softmax' })
-    ]
-  });
-
-  model.compile({
-    optimizer: tf.train.adam(0.04),
-    loss: 'sparseCrossentropy',
-    metrics: ['accuracy']
-  });
-
-  return model;
-}
-
-export function createRegressionModel(inputSize: number) {
-  const model = tf.sequential({
-    layers: [
-      tf.layers.dense({ inputShape: [inputSize], units: 12, activation: 'relu' }),
-      tf.layers.dense({ units: 1, activation: 'linear' })
-    ]
-  });
-
-  model.compile({
-    optimizer: tf.train.adam(0.03),
-    loss: 'meanSquaredError',
-    metrics: ['mae']
-  });
-
-  return model;
-}
-
-export async function trainClassificationModel(
-  features: number[][],
-  labels: number[],
-  options: TrainingOptions = {}
-) {
-  const inputSize = features[0]?.length ?? 0;
-  const classCount = Math.max(...labels) + 1;
-  const model = createClassificationModel(inputSize, classCount);
-
-  model.compile({
-    optimizer: tf.train.adam(options.learningRate ?? 0.04),
-    loss: 'sparseCrossentropy',
-    metrics: ['accuracy']
-  });
-
-  const xs = tf.tensor2d(features, [features.length, inputSize]);
-  const ys = tf.tensor1d(labels, 'int32');
-  const history = { loss: [] as number[], accuracy: [] as number[], valLoss: [] as number[], valAccuracy: [] as number[] };
-
-  const epochs = options.epochs ?? 12;
-  for (let epoch = 1; epoch <= epochs; epoch += 1) {
-    if (options.signal?.aborted) {
-      xs.dispose();
-      ys.dispose();
-      throw new DOMException('Training aborted', 'AbortError');
-    }
-
-    const fitResult = await model.fit(xs, ys, {
-      epochs: 1,
-      validationSplit: options.validationSplit ?? 0.2,
-      shuffle: true,
-      verbose: 0
-    });
-
-    const loss = Number(fitResult.history.loss?.[0] ?? 0);
-    const accuracy = Number(fitResult.history.acc?.[0] ?? 0);
-    const valLoss = Number(fitResult.history.val_loss?.[0] ?? 0);
-    const valAccuracy = Number(fitResult.history.val_acc?.[0] ?? 0);
-
-    history.loss.push(loss);
-    history.accuracy.push(accuracy);
-    history.valLoss.push(valLoss);
-    history.valAccuracy.push(valAccuracy);
-
-    options.onEpochEnd?.(epoch, {
-      loss,
-      accuracy,
-      valLoss,
-      valAccuracy
-    });
+export class CsvError extends Error {
+  readonly code: CsvErrorCode;
+  constructor(code: CsvErrorCode, message: string) {
+    super(message);
+    this.name = 'CsvError';
+    this.code = code;
   }
-
-  xs.dispose();
-  ys.dispose();
-
-  return { model, history };
 }
 
-export async function trainRegressionModel(
-  features: number[][],
-  targets: number[],
-  options: TrainingOptions = {}
-) {
-  const model = createRegressionModel(features[0]?.length ?? 1);
-  const xs = tf.tensor2d(features, [features.length, features[0].length]);
-  const ys = tf.tensor1d(targets);
+/** A raw cell: trimmed text, or null when the value is missing. */
+export type Cell = string | null;
+export type ColumnType = 'numeric' | 'categorical' | 'empty';
 
-  const history = { loss: [] as number[], mae: [] as number[], valLoss: [] as number[], valMae: [] as number[] };
-  const epochs = options.epochs ?? 18;
+export interface ColumnInfo {
+  name: string;
+  type: ColumnType;
+  /** Number of missing cells. */
+  missing: number;
+  /** Number of distinct non-missing values. */
+  unique: number;
+}
 
-  for (let epoch = 1; epoch <= epochs; epoch += 1) {
-    if (options.signal?.aborted) {
-      xs.dispose();
-      ys.dispose();
-      throw new DOMException('Training aborted', 'AbortError');
-    }
+export interface Table {
+  columns: ColumnInfo[];
+  rows: Cell[][];
+}
 
-    const fitResult = await model.fit(xs, ys, {
-      epochs: 1,
-      validationSplit: options.validationSplit ?? 0.2,
-      shuffle: true,
-      verbose: 0
-    });
+export interface ParseResult {
+  table: Table;
+  /** Non-fatal problems the user should know about. */
+  warnings: string[];
+}
 
-    const loss = Number(fitResult.history.loss?.[0] ?? 0);
-    const mae = Number(fitResult.history.mae?.[0] ?? 0);
-    const valLoss = Number(fitResult.history.val_loss?.[0] ?? 0);
-    const valMae = Number(fitResult.history.val_mae?.[0] ?? 0);
+const MISSING_TOKENS = new Set(['', 'na', 'n/a', 'nan', 'null', 'none', '?', '-']);
+const NUMBER_PATTERN = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
 
-    history.loss.push(loss);
-    history.mae.push(mae);
-    history.valLoss.push(valLoss);
-    history.valMae.push(valMae);
+export function isMissingToken(value: string): boolean {
+  return MISSING_TOKENS.has(value.trim().toLowerCase());
+}
 
-    options.onEpochEnd?.(epoch, { loss, valLoss });
+export function parseNumber(value: Cell): number | null {
+  if (value === null) return null;
+  const text = value.trim();
+  if (!NUMBER_PATTERN.test(text)) return null;
+  const n = Number(text);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Validate file metadata before reading it. Throws CsvError. */
+export function validateFileMeta(file: { name: string; size: number }): void {
+  if (file.size === 0) throw new CsvError('EMPTY', 'The file is empty.');
+  if (!/\.(csv|tsv|txt)$/i.test(file.name)) {
+    throw new CsvError('BAD_EXTENSION', 'Please choose a .csv, .tsv or .txt file.');
   }
-
-  xs.dispose();
-  ys.dispose();
-
-  return { model, history };
+  if (file.size > CSV_LIMITS.maxBytes) {
+    const mb = (CSV_LIMITS.maxBytes / (1024 * 1024)).toFixed(0);
+    throw new CsvError('TOO_LARGE', `The file is larger than the ${mb} MB limit.`);
+  }
 }
 
-export function predictClassification(model: tf.LayersModel, input: number[], labels: string[] = []) {
-  const tensor = tf.tensor2d([input]);
-  const output = model.predict(tensor) as tf.Tensor;
-  const probabilities = Array.from(output.dataSync());
-  const classIndex = probabilities.indexOf(Math.max(...probabilities));
-  const confidence = probabilities[classIndex] ?? 0;
-  const label = labels[classIndex] ?? `class_${classIndex}`;
-
-  tensor.dispose();
-  output.dispose();
-
-  return {
-    classIndex,
-    label,
-    confidence,
-    probabilities,
-    predictionText: `${label} (${(confidence * 100).toFixed(1)}% confidence)`
-  } satisfies ClassificationPrediction;
-}
-
-export async function predictRegression(model: tf.LayersModel, input: number[]) {
-  const tensor = tf.tensor2d([input]);
-  const value = model.predict(tensor) as tf.Tensor;
-  const prediction = Number(value.dataSync()[0] ?? 0);
-  const metrics = evaluateRegression([prediction], [prediction]);
-
-  tensor.dispose();
-  value.dispose();
-
-  return {
-    prediction,
-    featureValues: input,
-    metrics
-  } satisfies RegressionPrediction;
-}
-
-export function evaluateClassification(actual: number[], predicted: number[]) {
-  const length = actual.length;
-  let correct = 0;
-  let totalPositive = 0;
-  let truePositive = 0;
-  let falsePositive = 0;
-
-  for (let index = 0; index < length; index += 1) {
-    const actualLabel = actual[index];
-    const predictedLabel = predicted[index];
-
-    if (actualLabel === predictedLabel) {
-      correct += 1;
+/** Pick the most likely delimiter by counting candidates in the header line. */
+export function detectDelimiter(text: string): string {
+  const firstLine = text.split(/\r\n|\n|\r/, 1)[0] ?? '';
+  let best = ',';
+  let bestCount = 0;
+  for (const candidate of [',', ';', '\t']) {
+    let count = 0;
+    let inQuotes = false;
+    for (const ch of firstLine) {
+      if (ch === '"') inQuotes = !inQuotes;
+      else if (ch === candidate && !inQuotes) count++;
     }
-
-    if (predictedLabel === 1) {
-      totalPositive += 1;
-    }
-
-    if (actualLabel === 1 && predictedLabel === 1) {
-      truePositive += 1;
-    }
-
-    if (actualLabel === 0 && predictedLabel === 1) {
-      falsePositive += 1;
+    if (count > bestCount) {
+      best = candidate;
+      bestCount = count;
     }
   }
-
-  const accuracy = correct / Math.max(length, 1);
-  const precision = totalPositive === 0 ? 0 : truePositive / totalPositive;
-  const actualPositive = actual.filter((value) => value === 1).length;
-  const recall = actualPositive === 0 ? 0 : truePositive / actualPositive;
-
-  return { accuracy, precision, recall };
+  return best;
 }
 
-export function evaluateRegression(actual: number[], predicted: number[]) {
-  const length = actual.length || 1;
-  const mae = actual.reduce((sum, value, index) => sum + Math.abs(value - predicted[index]), 0) / length;
-  const mse = actual.reduce((sum, value, index) => sum + (value - predicted[index]) ** 2, 0) / length;
-  const rmse = Math.sqrt(mse);
-  const mean = actual.reduce((sum, value) => sum + value, 0) / length;
-  const ssRes = actual.reduce((sum, value, index) => sum + (value - predicted[index]) ** 2, 0);
-  const ssTot = actual.reduce((sum, value) => sum + (value - mean) ** 2, 0);
-  const r2 = ssTot === 0 ? 1 : 1 - ssRes / ssTot;
+/** RFC 4180-style tokenizer: quotes, escaped quotes, CRLF/LF/CR line endings. */
+export function tokenizeCsv(text: string, delimiter: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = '';
+  let inQuotes = false;
+  let fieldWasQuoted = false;
+  let i = 0;
 
-  return { mae, mse, rmse, r2 };
+  const endField = () => {
+    row.push(fieldWasQuoted ? field : field.trim());
+    field = '';
+    fieldWasQuoted = false;
+  };
+  const endRow = () => {
+    endField();
+    // Skip completely blank lines.
+    if (!(row.length === 1 && row[0] === '')) rows.push(row);
+    row = [];
+  };
+
+  while (i < text.length) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i += 2;
+          continue;
+        }
+        inQuotes = false;
+        i++;
+        continue;
+      }
+      field += ch;
+      i++;
+      continue;
+    }
+    if (ch === '"' && field.trim() === '') {
+      inQuotes = true;
+      fieldWasQuoted = true;
+      field = '';
+      i++;
+    } else if (ch === delimiter) {
+      endField();
+      i++;
+    } else if (ch === '\r' || ch === '\n') {
+      endRow();
+      i += ch === '\r' && text[i + 1] === '\n' ? 2 : 1;
+    } else {
+      field += ch;
+      i++;
+    }
+  }
+  if (inQuotes) {
+    throw new CsvError('UNTERMINATED_QUOTE', 'The file has a quote (") that is never closed.');
+  }
+  if (field !== '' || row.length > 0 || fieldWasQuoted) endRow();
+  return rows;
+}
+
+/** Parse CSV text into a typed Table. Throws CsvError for unusable input. */
+export function parseCsv(input: string): ParseResult {
+  const text = input.replace(/^﻿/, '');
+  if (text.trim() === '') throw new CsvError('EMPTY', 'The file is empty.');
+  if (text.includes('\u0000')) {
+    throw new CsvError('NOT_TEXT', 'This does not look like a text file (it contains binary data).');
+  }
+
+  const delimiter = detectDelimiter(text);
+  const raw = tokenizeCsv(text, delimiter);
+  if (raw.length < 2) {
+    throw new CsvError('NO_DATA_ROWS', 'The file needs a header row and at least one data row.');
+  }
+
+  const header = raw[0];
+  const body = raw.slice(1);
+  if (header.length > CSV_LIMITS.maxColumns) {
+    throw new CsvError('TOO_MANY_COLUMNS', `The file has more than ${CSV_LIMITS.maxColumns} columns.`);
+  }
+  if (body.length > CSV_LIMITS.maxRows) {
+    throw new CsvError('TOO_MANY_ROWS', `The file has more than ${CSV_LIMITS.maxRows} rows.`);
+  }
+
+  const warnings: string[] = [];
+
+  // Sanitize and de-duplicate column names.
+  const seen = new Map<string, number>();
+  const names = header.map((h, idx) => {
+    const base = sanitizeColumnName(h, idx);
+    const count = (seen.get(base) ?? 0) + 1;
+    seen.set(base, count);
+    return count === 1 ? base : `${base}_${count}`;
+  });
+  if (names.some((n, idx) => n !== sanitizeColumnName(header[idx], idx))) {
+    warnings.push('Some column names were duplicated and have been renamed.');
+  }
+
+  // Normalise ragged rows and missing tokens.
+  let raggedRows = 0;
+  const rows: Cell[][] = body.map((r) => {
+    if (r.length !== names.length) raggedRows++;
+    return names.map((_, c) => {
+      const value = r[c];
+      if (value === undefined || isMissingToken(value)) return null;
+      return value.trim();
+    });
+  });
+  if (raggedRows > 0) {
+    warnings.push(
+      `${raggedRows} row(s) had a different number of fields than the header; short rows were padded with missing values and extra fields were ignored.`,
+    );
+  }
+
+  const columns: ColumnInfo[] = names.map((name, c) => {
+    let missing = 0;
+    let numericCount = 0;
+    const distinct = new Set<string>();
+    for (const row of rows) {
+      const cell = row[c];
+      if (cell === null) {
+        missing++;
+      } else {
+        distinct.add(cell);
+        if (parseNumber(cell) !== null) numericCount++;
+      }
+    }
+    const present = rows.length - missing;
+    const type: ColumnType = present === 0 ? 'empty' : numericCount === present ? 'numeric' : 'categorical';
+    return { name, type, missing, unique: distinct.size };
+  });
+
+  if (columns.every((col) => col.type === 'empty')) {
+    throw new CsvError('NO_DATA_ROWS', 'Every cell in the file is missing.');
+  }
+
+  const missingTotal = columns.reduce((sum, col) => sum + col.missing, 0);
+  if (missingTotal > 0) {
+    warnings.push(`${missingTotal} missing value(s) found. You can drop those rows or fill them using training-set averages.`);
+  }
+  return { table: { columns, rows }, warnings };
+}
+
+/** Read and parse a user-selected file entirely in the browser. */
+export async function parseCsvFile(file: File): Promise<ParseResult> {
+  validateFileMeta(file);
+  const text = await file.text();
+  return parseCsv(text);
+}
+
+/** Serialise a table back to CSV text (cells neutralised against formula injection). */
+export function tableToCsv(headers: string[], rows: (string | number | null)[][]): string {
+  const lines = [headers.map((h) => toCsvField(h)).join(',')];
+  for (const row of rows) lines.push(row.map((v) => toCsvField(v)).join(','));
+  return `${lines.join('\n')}\n`;
+}
+
+/** Human-friendly message for any error thrown while loading a file. */
+export function describeLoadError(error: unknown): string {
+  if (error instanceof CsvError) return error.message;
+  return sanitizeText(error instanceof Error ? error.message : 'The file could not be read.', 200);
 }

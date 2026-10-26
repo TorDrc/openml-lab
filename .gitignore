@@ -1,7 +1,9 @@
 node_modules/
 dist/
-.vite/
 coverage/
-.DS_Store
-npm-debug.log*
+.env
+.env.*
 *.local
+*.log
+.DS_Store
+.vite/

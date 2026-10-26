@@ -2,15 +2,18 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta
-      name="description"
-      content="OpenML Lab is a browser-based machine learning laboratory for classification, regression, and dataset exploration."
-    />
-    <title>OpenML Lab</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="OpenML Lab — learn, train, predict and share machine-learning models entirely in your browser. No account, no server, no API key." />
+    <meta name="color-scheme" content="light dark" />
+    <!--CSP-->
+    <link rel="icon" type="image/svg+xml" href="%BASE_URL%favicon.svg" />
+    <title>OpenML Lab — Learn. Train. Predict. Share.</title>
+    <script src="%BASE_URL%theme-init.js"></script>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <noscript>OpenML Lab needs JavaScript to run machine-learning models in your browser.</noscript>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
